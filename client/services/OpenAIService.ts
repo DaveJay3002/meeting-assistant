@@ -6,7 +6,7 @@ const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
 // Available models in preference order
 const MODELS = {
-  GPT4: 'gpt-4',
+  GPT4: 'gpt-4o-mini',
   GPT3_TURBO: 'gpt-3.5-turbo',
 };
 
@@ -19,7 +19,7 @@ class OpenAIService {
     this.apiKey = Constants.expoConfig?.extra?.openAiApiKey || '';
     
     // Start with GPT-4 as default
-    this.currentModel = MODELS.GPT3_TURBO;
+    this.currentModel = MODELS.GPT4;
     
     if (!this.apiKey) {
       console.warn('OpenAI API key is not set. Chat functionality will not work.');
@@ -30,13 +30,13 @@ class OpenAIService {
    * Streams a chat completion response from OpenAI
    * 
    * @param prompt The user's message
-   * @param context Additional context (e.g., meeting transcript)
+   * @param summary Meeting summary from the database
    * @param onToken Callback function for each token received
    * @returns A promise that resolves when the stream is complete
    */
   async streamChatCompletion(
     prompt: string, 
-    context: string, 
+    summary: string, 
     onToken: (token: string) => void
   ): Promise<void> {
     try {
@@ -44,19 +44,19 @@ class OpenAIService {
         throw new Error('OpenAI API key is not configured');
       }
 
-      // Create system message with context
-      const systemMessage = `You are an AI assistant helping with meeting information. 
-      Use the following meeting transcript to answer the user's questions.
-      Only respond based on information in the transcript.
-      If the information isn't in the transcript, say so politely.
-      
-      Meeting Transcript:
-      ${context}`;
-
       // Limit the context if it's too large (OpenAI has token limits)
-      const truncatedContext = context.length > 15000 
-        ? context.substring(0, 15000) + '... (transcript truncated)'
-        : context;
+      const truncatedContext = summary.length > 15000 
+        ? summary.substring(0, 15000) + '... (transcript truncated)'
+        : summary;
+      
+      // Create system message with meeting summary
+      const systemMessage = `You are an AI assistant helping with meeting information. 
+      The following is a summary of the meeting:
+      ${truncatedContext}
+      
+      Use this summary to answer the user's questions.
+      Only respond based on information in the summary.
+      If the information isn't in the summary, say so politely.`;
       
       // Set up the request with streaming enabled
       const response = await fetch(OPENAI_API_URL, {
@@ -96,7 +96,7 @@ class OpenAIService {
           // Fallback to GPT-3.5 Turbo
           console.log('Falling back to GPT-3.5 Turbo');
           this.currentModel = MODELS.GPT3_TURBO;
-          return this.streamChatCompletion(prompt, context, onToken);
+          return this.streamChatCompletion(prompt, summary, onToken);
         }
         
         throw new Error(`OpenAI API error: ${errorMsg}`);
