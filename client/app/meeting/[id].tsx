@@ -432,39 +432,6 @@ export default function MeetingDetailScreen() {
     </View>
   );
   
-  // Add a direct download function for the download button
-  const handleDownloadPdf = async () => {
-    try {
-      if (!meeting?.pdfPath) {
-        Alert.alert('Error', 'PDF not available for this meeting');
-        return;
-      }
-      
-      const downloadUrl = await StorageService.getFileUrl(meeting.pdfPath);
-      
-      if (Platform.OS === 'web') {
-        // For web, we can use a hidden anchor element to trigger download
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = `meeting-summary-${meeting.id}.pdf`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-      } else {
-        // For native platforms, we'll share the file
-        const uri = await downloadPdf(meeting.pdfPath);
-        if (uri) {
-          await Sharing.shareAsync(uri);
-        } else {
-          throw new Error('Failed to prepare PDF for sharing');
-        }
-      }
-    } catch (error) {
-      console.error('Error downloading PDF:', error);
-      Alert.alert('Error', 'Failed to download PDF. Please try again.');
-    }
-  };
-  
   if (loading) {
     return (
       <View style={[styles.loadingContainer, { backgroundColor: theme.background }]}>
@@ -667,16 +634,6 @@ export default function MeetingDetailScreen() {
               {meeting.transcript || 'Transcript not available.'}
             </Text>
           </ScrollView>
-        )}
-        
-        {meeting.pdfPath && (
-          <TouchableOpacity
-            style={[styles.downloadButton, { backgroundColor: theme.primary }]}
-            onPress={handleDownloadPdf}
-          >
-            <MaterialIcons name="file-download" size={24} color="white" />
-            <Text style={styles.downloadButtonText}>Download PDF</Text>
-          </TouchableOpacity>
         )}
       </View>
       
@@ -999,28 +956,5 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     marginLeft: 8,
     fontSize: 16,
-  },
-  downloadButton: {
-    position: 'absolute',
-    top: 20,
-    right: 20,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 20,
-    elevation: 3,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1.41,
-    zIndex: 10,
-  },
-  downloadButtonText: {
-    color: 'white',
-    fontWeight: 'bold',
-    marginLeft: 8,
-    fontSize: 14,
   },
 }); 
