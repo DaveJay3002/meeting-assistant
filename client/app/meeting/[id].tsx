@@ -9,12 +9,17 @@ import {
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
-  FlatList
+  FlatList,
+  Linking,
+  Alert
 } from 'react-native';
 import { useLocalSearchParams, router } from 'expo-router';
 import { MaterialIcons } from '@expo/vector-icons';
 import { Appbar } from 'react-native-paper';
 import * as Haptics from 'expo-haptics';
+import * as FileSystem from 'expo-file-system';
+import * as IntentLauncher from 'expo-intent-launcher';
+import * as Sharing from 'expo-sharing';
 import Animated, { 
   useSharedValue, 
   useAnimatedStyle, 
@@ -24,42 +29,30 @@ import Animated, {
 } from 'react-native-reanimated';
 
 import { useTheme } from '@/contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
+import MeetingService, { Meeting } from '@/services/MeetingService';
+import StorageService from '@/services/StorageService';
+import OpenAIService from '@/services/OpenAIService';
+import SuggestedQuestion from '@/components/ui/SuggestedQuestion';
 
 // Tabs for the meeting details
 const TABS = {
   SUMMARY: 'summary',
   TRANSCRIPT: 'transcript',
-  CHAT: 'chat',
-};
-
-// Dummy meeting data for testing
-const DUMMY_MEETINGS = {
-  "meeting1": {
-    id: 'meeting1',
-    title: 'Project Kickoff Meeting',
-    date: '2023-09-15T10:00:00Z',
-    duration: '45 minutes',
-    summary: 'The team discussed project goals, timeline, and resource allocation for the new mobile app development. Key decisions were made regarding tech stack and team responsibilities.',
-    transcript: "John: Welcome everyone to our project kickoff. Let's start by discussing our objectives.\nSarah: I think we need to clarify the timeline first.\nMike: I agree with Sarah. Timeline will impact our technical choices.\nJohn: Good point. We have 3 months to complete the MVP.\nSarah: That's reasonable. I suggest we use React Native for cross-platform compatibility.\nMike: That makes sense. I can lead the backend development using Node.js.\nJohn: Perfect. Let's allocate resources now. Sarah, can you handle the UI/UX?\nSarah: Yes, I'll work with the design team to finalize mockups by next week.",
-  },
-  "meeting2": {
-    id: 'meeting2',
-    title: 'Weekly Status Update',
-    date: '2023-09-22T14:00:00Z',
-    duration: '30 minutes',
-    summary: 'The team reviewed progress on individual tasks, identified blockers, and adjusted the sprint timeline. All members committed to completing their assigned tasks by the end of the week.',
-    transcript: "Lisa: Let's go around and share our progress updates.\nTom: I've completed the authentication module but ran into issues with the API integration.\nLisa: What kind of issues?\nTom: The endpoints are returning unexpected data formats. I'm working with the backend team to resolve it.\nEmma: I've designed 60% of the UI screens. Should be done by Thursday.\nLisa: That's good progress. Any blockers besides Tom's API issue?\nEmma: Not from my side.\nTom: I might need an extra day for testing once the API issue is resolved.\nLisa: Noted. Let's adjust the timeline accordingly.",
-  }
+  PDF: 'pdf',
 };
 
 export default function MeetingDetailScreen() {
   const { theme } = useTheme();
+  const { user } = useAuth();
   const { id } = useLocalSearchParams();
   const meetingId = id as string;
   
-  const [meeting, setMeeting] = useState<any>(null);
+  const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [activeTab, setActiveTab] = useState(TABS.SUMMARY);
   const [loading, setLoading] = useState(true);
+  const [loadingPdf, setLoadingPdf] = useState(false);
+  const [pdfUri, setPdfUri] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<Array<{
     id: string;
     content: string;
@@ -68,6 +61,18 @@ export default function MeetingDetailScreen() {
   }>>([]);
   const [inputMessage, setInputMessage] = useState('');
   const [sendingMessage, setSendingMessage] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isChatExpanded, setIsChatExpanded] = useState(false);
+  const [streamingResponse, setStreamingResponse] = useState('');
+  
+  // Add suggested questions
+  const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([
+    "What were the key decisions made?",
+    "Who attended this meeting?",
+    "What action items were assigned?",
+    "Summarize this meeting briefly.",
+    "What are the main points discussed?"
+  ]);
   
   const scrollViewRef = useRef<ScrollView>(null);
   const chatScrollViewRef = useRef<FlatList>(null);
@@ -76,23 +81,145 @@ export default function MeetingDetailScreen() {
   const chatModalHeight = useSharedValue(0);
   const chatVisible = useSharedValue(0);
   
-  useEffect(() => {
-    // In a real app, fetch meeting data from Firebase or API
-    // For now, use dummy data
-    setLoading(true);
-    
-    // Simulate API call
-    setTimeout(() => {
-      const meetingData = DUMMY_MEETINGS[meetingId] || null;
+  const fetchMeetingData = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      
+      const meetingData = await MeetingService.getMeeting(meetingId);
+      
+      if (!meetingData) {
+        setError('Meeting not found');
+        setLoading(false);
+        return;
+      }
+      
       setMeeting(meetingData);
+      
+      // If meeting has PDF, download it
+      if (meetingData.pdfPath && meetingData.status === 'completed') {
+        await downloadPdf(meetingData.pdfPath);
+      }
+      
+    } catch (error) {
+      console.error('Error fetching meeting:', error);
+      setError('Failed to load meeting data. Please try again.');
+    } finally {
       setLoading(false);
-    }, 500);
+    }
+  };
+  
+  const downloadPdf = async (pdfPath: string) => {
+    try {
+      setLoadingPdf(true);
+      
+      // Get download URL from Firebase Storage
+      const downloadUrl = await StorageService.getFileUrl(pdfPath);
+      
+      // Create local file name
+      const fileName = pdfPath.split('/').pop() || 'meeting-summary.pdf';
+      
+      // Platform specific handling
+      if (Platform.OS === 'web') {
+        // For web platform, we'll just open the PDF in a new tab
+        setPdfUri(downloadUrl);
+        setLoadingPdf(false);
+        return downloadUrl;
+      } else {
+        // For native platforms, download the file
+        const localUri = `${FileSystem.documentDirectory}${fileName}`;
+        
+        try {
+          // Download the file
+          const { uri } = await FileSystem.downloadAsync(downloadUrl, localUri);
+          
+          setPdfUri(uri);
+          setLoadingPdf(false);
+          
+          return uri;
+        } catch (downloadError) {
+          console.error('Error downloading PDF file:', downloadError);
+          // Fallback to just returning the URL
+          setPdfUri(downloadUrl);
+          setLoadingPdf(false);
+          return downloadUrl;
+        }
+      }
+    } catch (error) {
+      console.error('Error downloading PDF:', error);
+      setLoadingPdf(false);
+      return null;
+    }
+  };
+  
+  const openPdf = async () => {
+    try {
+      if (!pdfUri) {
+        if (meeting?.pdfPath) {
+          const uri = await downloadPdf(meeting.pdfPath);
+          if (!uri) throw new Error('Failed to download PDF');
+        } else {
+          throw new Error('PDF not available');
+        }
+      }
+      
+      // Open PDF based on platform
+      if (Platform.OS === 'web') {
+        // For web, open in a new tab
+        window.open(pdfUri, '_blank');
+      } else if (Platform.OS === 'ios') {
+        await Sharing.shareAsync(pdfUri);
+      } else {
+        try {
+          const contentUri = await FileSystem.getContentUriAsync(pdfUri);
+          await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+            data: contentUri,
+            flags: 1,
+            type: 'application/pdf',
+          });
+        } catch (error) {
+          console.error('Error opening PDF with native viewer:', error);
+          // Fallback to opening in browser
+          Linking.openURL(pdfUri);
+        }
+      }
+    } catch (error) {
+      console.error('Error opening PDF:', error);
+      Alert.alert('Error', 'Failed to open PDF. Please try again.');
+    }
+  };
+  
+  const handleFixMeetingStatus = async () => {
+    try {
+      setLoading(true);
+      
+      // If the meeting has a summary but no PDF or is stuck in processing
+      if (meeting && meeting.id) {
+        await MeetingService.fixMeetingStatus(meeting.id);
+        await fetchMeetingData();
+      }
+      
+      setLoading(false);
+    } catch (error) {
+      console.error('Error fixing meeting:', error);
+      setLoading(false);
+      Alert.alert('Error', 'Failed to fix meeting status. Please try again.');
+    }
+  };
+  
+  useEffect(() => {
+    fetchMeetingData();
     
-    // No more WebSocket connection
+    // Remove interval-based update to improve performance
+    // Users can manually refresh with the refresh button
   }, [meetingId]);
   
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
+  const formatDate = (timestamp: any) => {
+    if (!timestamp) return 'Processing...';
+    
+    // Convert Firebase timestamp to JS Date
+    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+    
     return date.toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
@@ -103,8 +230,8 @@ export default function MeetingDetailScreen() {
   };
   
   const handleBackPress = () => {
-    // If chat is open, close it first
-    if (activeTab === TABS.CHAT && chatVisible.value === 1) {
+    // If chat is expanded, collapse it first
+    if (isChatExpanded) {
       closeChat();
       return;
     }
@@ -117,15 +244,27 @@ export default function MeetingDetailScreen() {
     // Haptic feedback
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     
+    // If PDF tab and PDF not available yet, don't switch
+    if (tab === TABS.PDF && !pdfUri && meeting?.status !== 'completed') {
+      Alert.alert('PDF Not Available', 'The PDF is not available yet. Please wait for processing to complete.');
+      return;
+    }
+    
     setActiveTab(tab);
     
     // If chat tab is selected, open chat modal
     if (tab === TABS.CHAT) {
       openChat();
     }
+    
+    // If PDF tab is selected, open PDF
+    if (tab === TABS.PDF) {
+      openPdf();
+    }
   };
   
   const openChat = () => {
+    setIsChatExpanded(true);
     chatModalHeight.value = withTiming(400, { duration: 300, easing: Easing.out(Easing.cubic) });
     chatVisible.value = withTiming(1, { duration: 300 });
   };
@@ -133,12 +272,16 @@ export default function MeetingDetailScreen() {
   const closeChat = () => {
     chatModalHeight.value = withTiming(0, { duration: 300, easing: Easing.in(Easing.cubic) });
     chatVisible.value = withTiming(0, { duration: 300 }, () => {
-      runOnJS(setActiveTab)(TABS.SUMMARY);
+      runOnJS(setIsChatExpanded)(false);
     });
   };
   
-  const handleSendMessage = () => {
+  const handleSendMessage = async () => {
     if (!inputMessage.trim() || sendingMessage) return;
+    if (!meeting?.transcript) {
+      Alert.alert('Error', 'Cannot answer questions without a transcript.');
+      return;
+    }
     
     // Create new message
     const newMessage = {
@@ -157,28 +300,112 @@ export default function MeetingDetailScreen() {
     // Set loading
     setSendingMessage(true);
     
-    // Simulate AI response (instead of using WebSockets)
-    setTimeout(() => {
-      const aiMessage = {
-        id: `ai-${Date.now()}`,
-        content: "This is a simulated response. WebSocket functionality has been removed.",
-        fromUser: false,
-        timestamp: new Date(),
-      };
+    // Prepare a placeholder for the AI response
+    const aiMessage = {
+      id: `ai-${Date.now()}`,
+      content: "",
+      fromUser: false,
+      timestamp: new Date(),
+    };
+    
+    setChatMessages(prev => [...prev, aiMessage]);
+    
+    try {
+      // Call your OpenAI API here using the transcript as context
+      // This is a placeholder for the real implementation
+      setStreamingResponse("");
+      await streamOpenAIResponse(inputMessage, meeting.transcript, aiMessage.id);
+    } catch (error) {
+      console.error('Error sending message to AI:', error);
       
-      setChatMessages(prev => [...prev, aiMessage]);
+      // Update the AI message with error content
+      setChatMessages(prev => 
+        prev.map(msg => 
+          msg.id === aiMessage.id 
+            ? {...msg, content: "Sorry, I encountered an error. Please try again."} 
+            : msg
+        )
+      );
+    } finally {
       setSendingMessage(false);
+      setStreamingResponse("");
       
       // Scroll to bottom
       setTimeout(() => {
         chatScrollViewRef.current?.scrollToEnd();
       }, 100);
-    }, 1000);
-    
-    // Scroll to bottom
-    setTimeout(() => {
-      chatScrollViewRef.current?.scrollToEnd();
-    }, 100);
+    }
+  };
+  
+  // Function to stream OpenAI response
+  const streamOpenAIResponse = async (question: string, transcript: string, messageId: string) => {
+    try {
+      // Check if transcript is available and has sufficient content
+      if (!transcript || transcript.trim().length < 10) {
+        // Update the message with an error response
+        setChatMessages(prev => 
+          prev.map(msg => 
+            msg.id === messageId 
+              ? {...msg, content: "I don't have enough transcript data to answer your question. Please ensure the meeting has been fully processed."} 
+              : msg
+          )
+        );
+        return;
+      }
+      
+      // Set up a callback function that updates the chat message in real-time
+      const onTokenReceived = (token: string) => {
+        setStreamingResponse(prev => prev + token);
+        
+        // Update the message in real-time as tokens arrive
+        setChatMessages(prev => 
+          prev.map(msg => 
+            msg.id === messageId 
+              ? {...msg, content: (msg.content || '') + token} 
+              : msg
+          )
+        );
+        
+        // Scroll to the bottom as new content arrives
+        setTimeout(() => {
+          chatScrollViewRef.current?.scrollToEnd({ animated: false });
+        }, 100);
+      };
+      
+      // Call the OpenAI service with streaming
+      await OpenAIService.streamChatCompletion(question, transcript, onTokenReceived);
+      
+      // The full response will be built up in the chatMessages state through the callback
+    } catch (error) {
+      console.error('Error in OpenAI streaming response:', error);
+      
+      // Update the message with a user-friendly error
+      setChatMessages(prev => 
+        prev.map(msg => 
+          msg.id === messageId 
+            ? {...msg, content: "I'm having trouble connecting to the AI service. Please check your connection and try again in a moment."} 
+            : msg
+        )
+      );
+      
+      // Optionally show an alert for critical errors
+      if (error instanceof Error && error.message.includes('API key')) {
+        Alert.alert(
+          'Configuration Error', 
+          'The AI service is not properly configured. Please contact support.',
+          [{ text: 'OK' }]
+        );
+      }
+    }
+  };
+  
+  // Handle selecting a suggested question
+  const handleSuggestedQuestion = (question: string) => {
+    setInputMessage(question);
+    // Optional: Uncomment if you want to auto-send the question
+    // setTimeout(() => {
+    //   handleSendMessage();
+    // }, 100);
   };
   
   // Chat modal animation style
@@ -199,26 +426,62 @@ export default function MeetingDetailScreen() {
       <Text style={[styles.messageText, { color: item.fromUser ? 'white' : theme.text }]}>
         {item.content}
       </Text>
+      <Text style={[styles.messageTime, { color: item.fromUser ? 'rgba(255,255,255,0.7)' : theme.border }]}>
+        {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      </Text>
     </View>
   );
+  
+  // Add a direct download function for the download button
+  const handleDownloadPdf = async () => {
+    try {
+      if (!meeting?.pdfPath) {
+        Alert.alert('Error', 'PDF not available for this meeting');
+        return;
+      }
+      
+      const downloadUrl = await StorageService.getFileUrl(meeting.pdfPath);
+      
+      if (Platform.OS === 'web') {
+        // For web, we can use a hidden anchor element to trigger download
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = `meeting-summary-${meeting.id}.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else {
+        // For native platforms, we'll share the file
+        const uri = await downloadPdf(meeting.pdfPath);
+        if (uri) {
+          await Sharing.shareAsync(uri);
+        } else {
+          throw new Error('Failed to prepare PDF for sharing');
+        }
+      }
+    } catch (error) {
+      console.error('Error downloading PDF:', error);
+      Alert.alert('Error', 'Failed to download PDF. Please try again.');
+    }
+  };
   
   if (loading) {
     return (
       <View style={[styles.loadingContainer, { backgroundColor: theme.background }]}>
         <ActivityIndicator size="large" color={theme.primary} />
-        <Text style={[styles.loadingText, { color: theme.text }]}>Loading meeting...</Text>
+        <Text style={[styles.loadingText, { color: theme.text }]}>Loading meeting data...</Text>
       </View>
     );
   }
   
-  if (!meeting) {
+  if (error || !meeting) {
     return (
       <View style={[styles.errorContainer, { backgroundColor: theme.background }]}>
         <MaterialIcons name="error-outline" size={64} color={theme.error} />
         <Text style={[styles.errorText, { color: theme.text }]}>
-          Meeting not found. It may have been deleted or you don't have access.
+          {error || 'Meeting not found'}
         </Text>
-        <TouchableOpacity 
+        <TouchableOpacity
           style={[styles.errorButton, { backgroundColor: theme.primary }]}
           onPress={() => router.back()}
         >
@@ -228,17 +491,96 @@ export default function MeetingDetailScreen() {
     );
   }
   
+  // Meeting is still processing
+  if (meeting.status === 'processing') {
+    return (
+      <KeyboardAvoidingView
+        style={[styles.container, { backgroundColor: theme.background }]}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <Appbar.Header style={{ backgroundColor: theme.background }}>
+          <Appbar.BackAction onPress={handleBackPress} color={theme.text} />
+          <Appbar.Content title="Meeting Details" titleStyle={{ color: theme.text }} />
+        </Appbar.Header>
+        
+        <View style={styles.processingContainer}>
+          <ActivityIndicator size="large" color={theme.primary} />
+          <Text style={[styles.processingTitle, { color: theme.text }]}>
+            Processing Your Recording
+          </Text>
+          <Text style={[styles.processingText, { color: theme.text }]}>
+            We're transcribing and summarizing your meeting. This may take a few minutes.
+          </Text>
+          <Text style={[styles.processingDate, { color: theme.text }]}>
+            Recording uploaded: {formatDate(meeting.createdAt)}
+          </Text>
+          <TouchableOpacity
+            style={[styles.refreshButton, { backgroundColor: theme.primary }]}
+            onPress={fetchMeetingData}
+          >
+            <Text style={styles.refreshButtonText}>Refresh</Text>
+          </TouchableOpacity>
+          {meeting?.status === 'processing' && (
+            <TouchableOpacity 
+              style={styles.fixButton}
+              onPress={handleFixMeetingStatus}
+            >
+              <MaterialIcons name="refresh" size={16} color={theme.primary} />
+              <Text style={[styles.fixButtonText, { color: theme.primary }]}>
+                Fix Status
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </KeyboardAvoidingView>
+    );
+  }
+  
+  // Meeting had an error
+  if (meeting.status === 'error') {
+    return (
+      <KeyboardAvoidingView
+        style={[styles.container, { backgroundColor: theme.background }]}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <Appbar.Header style={{ backgroundColor: theme.background }}>
+          <Appbar.BackAction onPress={handleBackPress} color={theme.text} />
+          <Appbar.Content title="Meeting Details" titleStyle={{ color: theme.text }} />
+        </Appbar.Header>
+        
+        <View style={styles.processingContainer}>
+          <MaterialIcons name="error-outline" size={64} color={theme.error} />
+          <Text style={[styles.processingTitle, { color: theme.error }]}>
+            Processing Error
+          </Text>
+          <Text style={[styles.processingText, { color: theme.text }]}>
+            There was an error processing your recording. Please try again later or contact support.
+          </Text>
+          <Text style={[styles.processingDate, { color: theme.text }]}>
+            Recording uploaded: {formatDate(meeting.createdAt)}
+          </Text>
+          <TouchableOpacity
+            style={[styles.refreshButton, { backgroundColor: theme.primary }]}
+            onPress={() => router.back()}
+          >
+            <Text style={styles.refreshButtonText}>Go Back</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    );
+  }
+  
+  // Main return for complete meeting screen
   return (
-    <KeyboardAvoidingView 
+    <KeyboardAvoidingView
       style={[styles.container, { backgroundColor: theme.background }]}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 88 : 0}
     >
       <Appbar.Header style={{ backgroundColor: theme.background }}>
-        <Appbar.BackAction color={theme.text} onPress={handleBackPress} />
+        <Appbar.BackAction onPress={handleBackPress} color={theme.text} />
         <Appbar.Content 
-          title={meeting.title} 
-          titleStyle={{ color: theme.text, fontSize: 18 }}
+          title={meeting.title || `Meeting ${formatDate(meeting.createdAt)}`} 
+          titleStyle={{ color: theme.text }} 
         />
       </Appbar.Header>
       
@@ -246,116 +588,108 @@ export default function MeetingDetailScreen() {
         <View style={styles.metaItem}>
           <MaterialIcons name="calendar-today" size={16} color={theme.text} />
           <Text style={[styles.metaText, { color: theme.text }]}>
-            {formatDate(meeting.date)}
-          </Text>
-        </View>
-        <View style={styles.metaItem}>
-          <MaterialIcons name="access-time" size={16} color={theme.text} />
-          <Text style={[styles.metaText, { color: theme.text }]}>
-            {meeting.duration}
+            {formatDate(meeting.createdAt)}
           </Text>
         </View>
       </View>
       
-      <View style={styles.tabBar}>
-        {Object.values(TABS).map((tab) => (
-          <TouchableOpacity
-            key={tab}
-            style={[
-              styles.tab,
-              activeTab === tab && styles.activeTab,
-              { borderBottomColor: activeTab === tab ? theme.primary : 'transparent' }
-            ]}
-            onPress={() => handleTabPress(tab)}
-          >
-            <Text 
-              style={[
-                styles.tabText, 
-                { color: activeTab === tab ? theme.primary : theme.text }
-              ]}
-            >
-              {tab.charAt(0).toUpperCase() + tab.slice(1)}
-            </Text>
-          </TouchableOpacity>
-        ))}
+      <View style={[styles.tabBar, { borderBottomColor: theme.border }]}>
+        <TouchableOpacity
+          style={[
+            styles.tab,
+            activeTab === TABS.SUMMARY && [styles.activeTab, { borderBottomColor: theme.primary }]
+          ]}
+          onPress={() => handleTabPress(TABS.SUMMARY)}
+        >
+          <Text style={[
+            styles.tabText,
+            { color: activeTab === TABS.SUMMARY ? theme.primary : theme.text }
+          ]}>
+            Summary
+          </Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity
+          style={[
+            styles.tab,
+            activeTab === TABS.TRANSCRIPT && [styles.activeTab, { borderBottomColor: theme.primary }]
+          ]}
+          onPress={() => handleTabPress(TABS.TRANSCRIPT)}
+        >
+          <Text style={[
+            styles.tabText,
+            { color: activeTab === TABS.TRANSCRIPT ? theme.primary : theme.text }
+          ]}>
+            Transcript
+          </Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity
+          style={[
+            styles.tab,
+            activeTab === TABS.PDF && [styles.activeTab, { borderBottomColor: theme.primary }]
+          ]}
+          onPress={() => handleTabPress(TABS.PDF)}
+        >
+          <Text style={[
+            styles.tabText,
+            { color: activeTab === TABS.PDF ? theme.primary : theme.text }
+          ]}>
+            PDF
+          </Text>
+          {loadingPdf && (
+            <ActivityIndicator size="small" color={theme.primary} style={styles.pdfLoadingIndicator} />
+          )}
+        </TouchableOpacity>
       </View>
       
       <View style={styles.contentContainer}>
         {activeTab === TABS.SUMMARY && (
-          <ScrollView 
+          <ScrollView
             ref={scrollViewRef}
             style={styles.scrollContent}
             showsVerticalScrollIndicator={false}
           >
             <Text style={[styles.contentTitle, { color: theme.text }]}>Summary</Text>
             <Text style={[styles.contentText, { color: theme.text }]}>
-              {meeting.summary}
+              {meeting.summary || 'Summary not available.'}
             </Text>
           </ScrollView>
         )}
         
         {activeTab === TABS.TRANSCRIPT && (
-          <ScrollView 
-            ref={scrollViewRef}
+          <ScrollView
             style={styles.scrollContent}
             showsVerticalScrollIndicator={false}
           >
             <Text style={[styles.contentTitle, { color: theme.text }]}>Transcript</Text>
-            {meeting.transcript.split('\n').map((line: string, index: number) => {
-              // Split by speaker and message
-              const parts = line.split(': ');
-              if (parts.length > 1) {
-                return (
-                  <View key={index} style={styles.transcriptLine}>
-                    <Text style={[styles.speaker, { color: theme.primary }]}>
-                      {parts[0]}:
-                    </Text>
-                    <Text style={[styles.transcriptText, { color: theme.text }]}>
-                      {parts.slice(1).join(': ')}
-                    </Text>
-                  </View>
-                );
-              }
-              return (
-                <Text key={index} style={[styles.transcriptText, { color: theme.text }]}>
-                  {line}
-                </Text>
-              );
-            })}
+            <Text style={[styles.transcriptText, { color: theme.text }]}>
+              {meeting.transcript || 'Transcript not available.'}
+            </Text>
           </ScrollView>
         )}
         
-        {activeTab === TABS.CHAT && (
-          <View style={styles.chatPromptContainer}>
-            <Text style={[styles.chatPromptTitle, { color: theme.text }]}>
-              Ask AI about this meeting
-            </Text>
-            <Text style={[styles.chatPromptText, { color: theme.text }]}>
-              You can ask questions about specific details, action items, decisions, or get a more detailed summary.
-            </Text>
-            <View style={styles.chatPromptExamples}>
-              <TouchableOpacity 
-                style={[styles.exampleButton, { backgroundColor: theme.card }]}
-                onPress={() => setInputMessage("What were the main action items?")}
-              >
-                <Text style={[styles.exampleButtonText, { color: theme.text }]}>Action items</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.exampleButton, { backgroundColor: theme.card }]}
-                onPress={() => setInputMessage("Who attended this meeting?")}
-              >
-                <Text style={[styles.exampleButtonText, { color: theme.text }]}>Attendees</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.exampleButton, { backgroundColor: theme.card }]}
-                onPress={() => setInputMessage("What key decisions were made?")}
-              >
-                <Text style={[styles.exampleButtonText, { color: theme.text }]}>Decisions</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+        {meeting.pdfPath && (
+          <TouchableOpacity
+            style={[styles.downloadButton, { backgroundColor: theme.primary }]}
+            onPress={handleDownloadPdf}
+          >
+            <MaterialIcons name="file-download" size={24} color="white" />
+            <Text style={styles.downloadButtonText}>Download PDF</Text>
+          </TouchableOpacity>
         )}
       </View>
+      
+      {/* Fixed Chat Button */}
+      {!isChatExpanded && (
+        <TouchableOpacity
+          style={[styles.chatButton, { backgroundColor: theme.primary }]}
+          onPress={openChat}
+        >
+          <MaterialIcons name="chat" size={24} color="white" />
+          <Text style={styles.chatButtonText}>Ask AI about this meeting</Text>
+        </TouchableOpacity>
+      )}
       
       <Animated.View style={[styles.chatModal, chatModalStyle, { backgroundColor: theme.background }]}>
         <View style={styles.chatHeader}>
@@ -377,6 +711,16 @@ export default function MeetingDetailScreen() {
               <Text style={[styles.emptyChatText, { color: theme.text }]}>
                 Ask a question about the meeting to get started.
               </Text>
+              {/* Suggested questions */}
+              <View style={styles.suggestedQuestionsContainer}>
+                {suggestedQuestions.map((question, index) => (
+                  <SuggestedQuestion 
+                    key={index} 
+                    text={question} 
+                    onPress={() => handleSuggestedQuestion(question)} 
+                  />
+                ))}
+              </View>
             </View>
           }
         />
@@ -441,6 +785,36 @@ const styles = StyleSheet.create({
     color: 'white',
     fontWeight: 'bold',
   },
+  processingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  processingTitle: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  processingText: {
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 24,
+  },
+  processingDate: {
+    fontSize: 14,
+    marginBottom: 24,
+  },
+  refreshButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  refreshButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+  },
   metaContainer: {
     flexDirection: 'row',
     paddingHorizontal: 16,
@@ -465,12 +839,19 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: 'center',
     borderBottomWidth: 2,
+    borderBottomColor: 'transparent',
+    position: 'relative',
   },
   activeTab: {
     borderBottomWidth: 2,
   },
   tabText: {
     fontWeight: '500',
+  },
+  pdfLoadingIndicator: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
   },
   contentContainer: {
     flex: 1,
@@ -488,60 +869,22 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
   },
-  transcriptLine: {
-    flexDirection: 'row',
-    marginBottom: 12,
-  },
-  speaker: {
-    fontWeight: 'bold',
-    marginRight: 4,
-  },
   transcriptText: {
-    flex: 1,
     fontSize: 16,
-    lineHeight: 22,
-  },
-  chatPromptContainer: {
-    flex: 1,
-    padding: 16,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  chatPromptTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 12,
-    textAlign: 'center',
-  },
-  chatPromptText: {
-    fontSize: 16,
-    textAlign: 'center',
-    marginBottom: 24,
-  },
-  chatPromptExamples: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: 8,
-  },
-  exampleButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 16,
-    marginHorizontal: 4,
-  },
-  exampleButtonText: {
-    fontSize: 14,
+    lineHeight: 24,
   },
   chatModal: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    boxShadow: '0px -2px 4px rgba(0, 0, 0, 0.1)',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
     elevation: 5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -3 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
   },
   chatHeader: {
     flexDirection: 'row',
@@ -556,22 +899,15 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
   chatList: {
-    padding: 12,
-  },
-  emptyChatContainer: {
-    padding: 20,
-    alignItems: 'center',
-  },
-  emptyChatText: {
-    textAlign: 'center',
-    fontSize: 14,
+    padding: 16,
+    flexGrow: 1,
   },
   messageContainer: {
     maxWidth: '80%',
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: 16,
-    marginBottom: 8,
+    borderRadius: 18,
+    marginBottom: 12,
   },
   userMessage: {
     alignSelf: 'flex-end',
@@ -583,25 +919,108 @@ const styles = StyleSheet.create({
   },
   messageText: {
     fontSize: 16,
+    lineHeight: 22,
+  },
+  messageTime: {
+    fontSize: 12,
+    alignSelf: 'flex-end',
+    marginTop: 4,
+  },
+  emptyChatContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  emptyChatText: {
+    fontSize: 14,
+    textAlign: 'center',
+    opacity: 0.7,
+    marginBottom: 20,
+  },
+  suggestedQuestionsContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    marginTop: 16,
   },
   inputContainer: {
     flexDirection: 'row',
-    padding: 12,
-    borderTopWidth: 1,
     alignItems: 'center',
+    padding: 8,
+    borderTopWidth: 1,
   },
   input: {
     flex: 1,
-    height: 40,
-    borderRadius: 20,
     paddingHorizontal: 16,
-    marginRight: 8,
+    paddingVertical: 10,
+    borderRadius: 20,
+    fontSize: 16,
+    maxHeight: 100,
   },
   sendButton: {
     width: 40,
     height: 40,
     borderRadius: 20,
-    justifyContent: 'center',
+    marginLeft: 8,
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fixButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fixButtonText: {
+    fontSize: 14,
+    marginLeft: 8,
+  },
+  chatButton: {
+    position: 'absolute',
+    bottom: 20,
+    left: 20,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 30,
+    elevation: 5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+  },
+  chatButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    marginLeft: 8,
+    fontSize: 16,
+  },
+  downloadButton: {
+    position: 'absolute',
+    top: 20,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1.41,
+    zIndex: 10,
+  },
+  downloadButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    marginLeft: 8,
+    fontSize: 14,
   },
 }); 

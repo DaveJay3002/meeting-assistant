@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert } from 'react-native';
-// Using the new audio package
-import * as Audio from 'expo-audio';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, Platform } from 'react-native';
+// Using expo-av instead of deprecated expo-audio
+import { Audio } from 'expo-av';
 import * as Haptics from 'expo-haptics';
 import { MaterialIcons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import Animated, { 
   useSharedValue, 
   useAnimatedStyle, 
@@ -17,6 +18,8 @@ import Animated, {
 
 import { useTheme } from '@/contexts/ThemeContext';
 import { useAuth } from '@/contexts/AuthContext';
+import StorageService from '@/services/StorageService';
+import MeetingService from '@/services/MeetingService';
 
 export default function HomeScreen() {
   const { theme } = useTheme();
@@ -24,6 +27,7 @@ export default function HomeScreen() {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
   const durationRef = useRef<NodeJS.Timeout | null>(null);
 
   // Animation values
@@ -33,8 +37,6 @@ export default function HomeScreen() {
   const recordingPulse = useSharedValue(1);
 
   useEffect(() => {
-    // No more WebSocket connection
-    
     // Clean up
     return () => {
       stopRecording();
@@ -75,29 +77,61 @@ export default function HomeScreen() {
 
   const startRecording = async () => {
     try {
-      // Request permissions
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission required', 'You need to grant audio recording permissions to use this feature.');
+      // Check if user is logged in
+      if (!user) {
+        Alert.alert(
+          'Login Required', 
+          'You need to be logged in to record meetings.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Login', onPress: () => router.push('/auth/login') }
+          ]
+        );
         return;
       }
 
-      // Set up audio recording - using the new API
-      await Audio.setModeAsync({
+      // Handle permissions based on platform
+      if (Platform.OS === 'web') {
+        // For web, we need to check if the browser supports getUserMedia
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          Alert.alert('Browser Not Supported', 'Your browser does not support audio recording. Please try a different browser.');
+          return;
+        }
+        
+        // Request microphone access using the browser's native API
+        try {
+          await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+          Alert.alert('Permission Denied', 'Microphone access is required to record audio.');
+          return;
+        }
+      } else {
+        // For mobile platforms, use expo-av permissions
+        const { status } = await Audio.requestPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('Permission required', 'You need to grant audio recording permissions to use this feature.');
+          return;
+        }
+      }
+
+      // Set up audio recording
+      await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
       });
 
-      // Start recording - using the new API
-      const recorder = new Audio.Recorder();
-      await recorder.prepareToRecordAsync(Audio.RecordingOptions.HIGH_QUALITY);
-      await recorder.startAsync();
+      // Start recording using expo-av
+      const { recording: newRecording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
       
-      setRecording(recorder);
+      setRecording(newRecording);
       setIsRecording(true);
-
-      // Trigger haptic feedback
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      
+      // Trigger haptic feedback (skip on web)
+      if (Platform.OS !== 'web') {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      }
 
       // Button press animation
       buttonScale.value = withSpring(0.9, { damping: 10 });
@@ -117,28 +151,60 @@ export default function HomeScreen() {
     }
   };
 
+  const uploadToFirebase = async (fileUri: string) => {
+    if (!user || !user.uid) {
+      Alert.alert('Error', 'You need to be logged in to upload recordings.');
+      return null;
+    }
+
+    try {
+      setIsUploading(true);
+      
+      // 1. Upload the audio file to Firebase Storage
+      const audioPath = await StorageService.uploadAudio(fileUri, user.uid);
+      
+      // 2. Create a meeting record in Firestore
+      const meetingId = await MeetingService.createMeeting(audioPath, user.uid);
+      
+      console.log('Recording uploaded and meeting created:', meetingId);
+      
+      // 3. Navigate to the library tab
+      Alert.alert(
+        'Recording Uploaded',
+        'Your recording has been uploaded and is being processed. You can view it in the Library tab.',
+        [{ text: 'OK', onPress: () => router.push('/library') }]
+      );
+      
+      return meetingId;
+    } catch (error) {
+      console.error('Error uploading recording:', error);
+      Alert.alert('Upload Failed', 'Failed to upload your recording. Please try again.');
+      return null;
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
   const stopRecording = async () => {
     if (!recording) return;
 
     try {
-      // Stop recording - using the new API
+      // Stop recording
       await recording.stopAndUnloadAsync();
       setIsRecording(false);
       
-      // Get recording URI - using the new API
-      const info = await recording.getInfoAsync();
-      const uri = info.uri;
+      // Get recording URI
+      const uri = recording.getURI();
       setRecording(null);
 
-      // Trigger haptic feedback
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      // Trigger haptic feedback (skip on web)
+      if (Platform.OS !== 'web') {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      }
       
-      // Process the recording (in a real app, we would upload the file)
+      // Process the recording
       if (uri) {
-        console.log('Recording saved at', uri);
-        // Instead of WebSocket, we'll just log the meeting ID for now
-        const meetingId = `meeting_${Date.now()}`;
-        console.log('Created new meeting with ID:', meetingId);
+        await uploadToFirebase(uri);
       }
 
       // Button press animation
@@ -202,6 +268,12 @@ export default function HomeScreen() {
           </View>
         )}
         
+        {isUploading && (
+          <View style={styles.uploadingContainer}>
+            <Text style={[styles.uploadingText, { color: theme.primary }]}>Uploading...</Text>
+          </View>
+        )}
+        
         <View style={styles.buttonContainer}>
           <Animated.View style={[styles.ripple, rippleAnimatedStyle, { backgroundColor: isRecording ? theme.error : theme.primary }]} />
           <Animated.View style={[styles.buttonOuter, buttonAnimatedStyle, { borderColor: isRecording ? theme.error : theme.primary }]}>
@@ -209,6 +281,7 @@ export default function HomeScreen() {
               style={[styles.button, { backgroundColor: isRecording ? theme.error : theme.primary }]}
               onPress={toggleRecording}
               activeOpacity={0.8}
+              disabled={isUploading}
             >
               <MaterialIcons
                 name={isRecording ? 'stop' : 'mic'}
@@ -224,7 +297,9 @@ export default function HomeScreen() {
         <Text style={[styles.helpText, { color: theme.text }]}>
           {isRecording 
             ? 'Tap the button again to stop recording' 
-            : 'Your recordings will appear in the Library tab'}
+            : isUploading
+              ? 'Please wait while your recording is being uploaded'
+              : 'Your recordings will appear in the Library tab'}
         </Text>
       </View>
     </View>
@@ -302,6 +377,13 @@ const styles = StyleSheet.create({
   durationText: {
     fontSize: 16,
     fontFamily: 'SpaceMono',
+  },
+  uploadingContainer: {
+    marginBottom: 24,
+  },
+  uploadingText: {
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   bottomSection: {
     marginBottom: 40,
