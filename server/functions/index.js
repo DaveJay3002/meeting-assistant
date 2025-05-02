@@ -2,7 +2,6 @@ const { onObjectFinalized } = require("firebase-functions/v2/storage");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getStorage } = require("firebase-admin/storage");
-const { onRequest } = require("firebase-functions/v2/https");
 
 const { OpenAI } = require("openai");
 const { Storage } = require("@google-cloud/storage");
@@ -17,13 +16,30 @@ const db = getFirestore();
 const storage = new Storage();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-exports.processAudio = onObjectFinalized({ region: "us-central1" }, async (event) => {
+exports.processAudio = onObjectFinalized({ region: "asia-south1" }, async (event) => {
   try {
-    const object = event;
+    const object = event.data;
+
+    if (!object) {
+      console.error("No event data received.");
+      return;
+    }
+
     const filePath = object.name;
     const contentType = object.contentType;
 
-    if (!contentType.startsWith("audio/")) return;
+    if (!filePath) {
+      console.error("No file path found in event data.");
+      return;
+    }
+
+    const validExtensions = [".mp3", ".wav", ".m4a"];
+    const ext = path.extname(filePath).toLowerCase();
+
+    if ((!contentType || !contentType.startsWith("audio/")) && !validExtensions.includes(ext)) {
+      console.log("Skipping unsupported file type:", contentType, ext);
+      return;
+    }
 
     const fileName = path.basename(filePath);
     const bucket = getStorage().bucket(object.bucket);
@@ -76,6 +92,7 @@ exports.processAudio = onObjectFinalized({ region: "us-central1" }, async (event
 
     fs.unlinkSync(tempAudioPath);
     fs.unlinkSync(tempPdfPath);
+    console.log(`Successfully processed and summarized ${filePath}`);
   } catch (err) {
     console.error("Function failed:", err);
   }
